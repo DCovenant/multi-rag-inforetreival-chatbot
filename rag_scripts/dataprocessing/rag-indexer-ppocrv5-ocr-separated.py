@@ -1,1229 +1,1148 @@
 #!/usr/bin/env python3
 """
-Enhanced OCR Extraction Script with Structure Detection
-========================================================
+RAG Document OCR Extraction with PPOCRv5 + Structure Preservation
+=================================================================
 
-NEW FEATURES vs original:
-1. ✅ Detects and preserves document structure (headings, sections, lists)
-2. ✅ Smart chunking that respects sections and doesn't break mid-paragraph
-3. ✅ Extracts metadata (section numbers, document codes, has tables/figures)
-4. ✅ Better handling of tables and structured content
-5. ✅ OCR quality validation with confidence scores
-6. ✅ TABLE EXTRACTION using pdfplumber (preserves table structure)
-7. ✅ Figure caption linking to nearby content
-8. ✅ Multi-column layout handling with reading order correction
+Extracts text from PDFs using PaddleOCR's PPOCRv5 model with GPU acceleration.
+Preserves document structure: titles, headers, sections, tables, body text.
+
+Compatible with PaddleOCR 3.3.2+
+
+Requirements:
+  pip install paddlepaddle-gpu paddleocr pdf2image opencv-python numpy tqdm
 
 Usage:
-  python enhanced_ocr_extraction.py pdfs/ --output enhanced_output.json
+  python rag-indexer-ppocrv5.py pdfs/ --output output.json
 """
+import warnings
+warnings.filterwarnings("ignore")
 
-from paddleocr import PaddleOCR
-import numpy as np
-import sys
 import os
-from pdf2image import convert_from_path
+import sys
 import argparse
-from tqdm import tqdm
-import gc
-import cv2
-from PIL import Image
-import re
 import json
 import logging
+import gc
+import re
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional, Tuple, Any
+from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
-# Table extraction
-try:
-    import pdfplumber
-    PDFPLUMBER_AVAILABLE = True
-except ImportError:
-    PDFPLUMBER_AVAILABLE = False
-    print("⚠️ pdfplumber not installed. Table extraction disabled. Install with: pip install pdfplumber")
+import numpy as np
+import cv2
+from PIL import Image
+from pdf2image import convert_from_path
+from tqdm import tqdm
 
-Image.MAX_IMAGE_PIXELS = None
+from paddleocr import PaddleOCR
+
+# Memory optimization
+os.environ['FLAGS_allocator_strategy'] = 'auto_growth'
+os.environ['FLAGS_fast_eager_deletion_mode'] = 'True'
+Image.MAX_IMAGE_PIXELS = 933120000
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('enhanced_ocr_extraction.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- CONFIG ---
-MIN_WORDS_FOR_PAGE = 5
+# Configuration
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
-MAX_SHORT_SIDE = 1200
-
-# Pre-built blacklist
-TEXT_BLACKLIST = frozenset({
-    "", " ", "i", "ii", "iii", "iv", "v", 
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
-    "a", "b", "c", "d", "e", ".", ",", "-", "_", "|"
-})
-
-# Regex patterns compiled once
-SINGLE_LETTER_PATTERN = re.compile(r'^[a-zA-Z]{1,2}$')
-SINGLE_DIGIT_PATTERN = re.compile(r'^\d$')
-# Multiple header patterns for better detection
-SECTION_HEADER_PATTERNS = [
-    re.compile(r'^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{3,100})$', re.MULTILINE),  # "1.1 Title" (extended length)
-    re.compile(r'^(Appendix\s+[A-Z0-9])\s*[:\-]?\s*(.{3,80})$', re.MULTILINE | re.IGNORECASE),  # "Appendix A: Title"
-    re.compile(r'^([A-Z][A-Z\s]{5,60})$', re.MULTILINE),  # "ALL CAPS HEADER"
-]
-SECTION_HEADER_PATTERN = SECTION_HEADER_PATTERNS[0]  # Keep for backward compat
-DOC_CODE_PATTERN = re.compile(r'[A-Z]{2,4}-[A-Z]{2,4}-[A-Z]{2,4}-\d{3}')
-TABLE_MARKER = re.compile(r'Table\s+\d+\.?\d*', re.IGNORECASE)
-FIGURE_MARKER = re.compile(r'Figure\s+\d+\.?\d*', re.IGNORECASE)
-APPENDIX_PATTERN = re.compile(r'^Appendix\s+[A-Z0-9]', re.MULTILINE)
-# Document reference pattern (catches references like RS-COR-IS-005, WI-ENG-LCP-701)
-DOC_REF_PATTERN = re.compile(r'[A-Z]{2,4}-[A-Z]{2,4}-[A-Z]{2,4}-\d{2,4}')
+DPI = 200
 
 
-def is_valid_text(text: str) -> bool:
-    """Fast text validation"""
-    if not text:
-        return False
-    t = text.strip().lower()
-    if len(t) < 3:
-        return False
-    if t in TEXT_BLACKLIST:
-        return False
-    if SINGLE_LETTER_PATTERN.match(text):
-        return False
-    if SINGLE_DIGIT_PATTERN.match(text):
-        return False
-    return True
+@dataclass
+class TextBlock:
+    """Represents a detected text block."""
+    text: str
+    confidence: float
+    line_index: int
+    block_type: str = "body"  # title, section_header, subsection_header, table_header, table_cell, body
+    section_number: Optional[str] = None
+    level: int = 0
+    bbox: Optional[List[int]] = None  # [x_min, y_min, x_max, y_max]
 
 
-def resize_if_large(img_bgr: np.ndarray, max_short_side: int = MAX_SHORT_SIDE) -> np.ndarray:
-    """Resize image if too large"""
-    h, w = img_bgr.shape[:2]
-    short_side = min(h, w)
-    if short_side > max_short_side:
-        ratio = max_short_side / short_side
-        new_w, new_h = int(w * ratio), int(h * ratio)
-        return cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return img_bgr
-
-
-# =========================================================
-# NEW: STRUCTURE DETECTION
-# =========================================================
-
-def detect_section_headers(text: str) -> List[Tuple[str, str, int]]:
-    """
-    Detect section headers like "3.1 Process to Assure Cyber Security"
-    Returns: List of (section_number, header_text, position)
-    """
-    headers = []
-    for match in SECTION_HEADER_PATTERN.finditer(text):
-        section_num = match.group(1)
-        header_text = match.group(2)
-        position = match.start()
-        headers.append((section_num, header_text, position))
-    return headers
-
-
-def extract_document_code(text: str) -> Optional[str]:
-    """Extract document codes like BN-NET-GOV-501"""
-    match = DOC_CODE_PATTERN.search(text)
-    return match.group(0) if match else None
-
-
-def detect_structural_elements(text: str) -> Dict:
-    """
-    Detect structural elements in document
-    Returns dict with: has_table, has_figure, has_appendix, doc_code, doc_references
-    """
-    # Find all document references (e.g., RS-COR-IS-005, WI-ENG-LCP-701)
-    doc_refs = list(set(DOC_REF_PATTERN.findall(text)))
+@dataclass 
+class DocumentChunk:
+    """A chunk ready for Elasticsearch indexing."""
+    chunk_id: str
+    file_name: str
+    page_number: int
+    chunk_index: int
+    chunk_text: str
+    word_count: int
+    content_type: str
+    section_hierarchy: List[str] = field(default_factory=list)
+    section_number: Optional[str] = None
+    parent_section: Optional[str] = None
+    has_table: bool = False
+    table_data: Optional[Dict] = None
+    source_folder: str = ""
+    confidence: float = 0.0
     
-    return {
-        'has_table': bool(TABLE_MARKER.search(text)),
-        'has_figure': bool(FIGURE_MARKER.search(text)),
-        'has_appendix': bool(APPENDIX_PATTERN.search(text)),
-        'doc_code': extract_document_code(text),
-        'doc_references': doc_refs,  # List of referenced documents
-        'table_count': len(TABLE_MARKER.findall(text)),
-        'figure_count': len(FIGURE_MARKER.findall(text)),
-    }
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
-def is_likely_header(text: str, next_text: str = None) -> bool:
+class SectionHierarchyTracker:
     """
-    Heuristic to detect if text is a header:
-    - Starts with number (1, 1.1, 3.2.1)
-    - All caps or Title Case
-    - Short (< 100 chars)
-    - Followed by longer paragraph
+    Tracks section hierarchy with strict validation.
+    Only updates hierarchy when encountering valid section headers.
     """
-    text = text.strip()
     
-    # Check for numbered sections
-    if re.match(r'^\d+(?:\.\d+)*\s+[A-Z]', text):
-        return True
-    
-    # Check for appendix headers
-    if re.match(r'^Appendix\s+[A-Z0-9]', text):
-        return True
-    
-    # All caps short text (likely header)
-    if text.isupper() and len(text) < 80 and len(text.split()) < 10:
-        return True
-    
-    # Title case with short length
-    if text.istitle() and len(text) < 80:
-        return True
-    
-    return False
-
-
-# =========================================================
-# NEW: TABLE EXTRACTION WITH PDFPLUMBER
-# =========================================================
-
-def extract_tables_from_pdf(pdf_path: str) -> Dict[int, List[Dict]]:
-    """
-    Extract tables from PDF using pdfplumber.
-    Returns: Dict mapping page_num -> list of table dicts
-    
-    Each table dict contains:
-    - 'text': Formatted table as text (markdown-style)
-    - 'bbox': Bounding box (x0, y0, x1, y1)
-    - 'rows': Number of rows
-    - 'cols': Number of columns
-    - 'caption': Detected table caption if nearby
-    """
-    if not PDFPLUMBER_AVAILABLE:
-        return {}
-    
-    tables_by_page = {}
-    
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                page_tables = []
-                
-                # Extract tables from this page
-                tables = page.extract_tables()
-                
-                if not tables:
-                    continue
-                
-                # Get page text to find captions
-                page_text = page.extract_text() or ""
-                
-                for table_idx, table in enumerate(tables):
-                    if not table or len(table) < 2:  # Skip empty/single-row tables
-                        continue
-                    
-                    # Format table as markdown-style text
-                    formatted_rows = []
-                    max_cols = max(len(row) for row in table if row)
-                    
-                    for row_idx, row in enumerate(table):
-                        if not row:
-                            continue
-                        
-                        # Clean cells
-                        cells = []
-                        for cell in row:
-                            cell_text = str(cell).strip() if cell else ""
-                            cell_text = cell_text.replace('\n', ' ')
-                            cells.append(cell_text)
-                        
-                        # Pad row if needed
-                        while len(cells) < max_cols:
-                            cells.append("")
-                        
-                        formatted_rows.append(" | ".join(cells))
-                        
-                        # Add separator after header row
-                        if row_idx == 0:
-                            formatted_rows.append("-" * 50)
-                    
-                    table_text = "\n".join(formatted_rows)
-                    
-                    # Try to find table caption
-                    caption = find_table_caption(page_text, table_idx + 1)
-                    
-                    # Get table bounding box if available
-                    try:
-                        table_settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
-                        table_finder = page.find_tables(table_settings)
-                        bbox = table_finder[table_idx].bbox if table_idx < len(table_finder) else None
-                    except:
-                        bbox = None
-                    
-                    page_tables.append({
-                        'text': table_text,
-                        'caption': caption,
-                        'rows': len(table),
-                        'cols': max_cols,
-                        'bbox': bbox,
-                        'table_index': table_idx
-                    })
-                
-                if page_tables:
-                    tables_by_page[page_num] = page_tables
-                    
-    except Exception as e:
-        logger.warning(f"Table extraction failed for {pdf_path}: {e}")
-    
-    return tables_by_page
-
-
-def find_table_caption(page_text: str, table_num: int) -> Optional[str]:
-    """
-    Find caption for a table (e.g., 'Table 1: Description...')
-    """
-    # Look for patterns like "Table 1:", "Table 1.", "Table 1 -"
-    patterns = [
-        rf'(Table\s+{table_num}[.:]\s*[^\n]{{5,100}})',
-        rf'(Table\s+{table_num}\s*[-–]\s*[^\n]{{5,100}})',
-        rf'(Table\s+{table_num}\s+[A-Z][^\n]{{5,80}})',
+    # Strict patterns - must be standalone section headers, not embedded in text
+    VALID_SECTION_PATTERNS = [
+        # Standard numbered sections: "1 Introduction", "2 Requirements"
+        # Must have: number, space, capitalized word, reasonable title length
+        (r'^(\d{1,2})\s+([A-Z][a-zA-Z\s]{2,50})$', 'major'),
+        
+        # Subsections: "1.1 Overview", "2.3.1 Details"
+        (r'^(\d{1,2}\.\d{1,2})\s+([A-Z][a-zA-Z\s]{2,60})$', 'sub'),
+        (r'^(\d{1,2}\.\d{1,2}\.\d{1,2})\s+([A-Z][a-zA-Z\s]{2,60})$', 'subsub'),
+        
+        # Appendix patterns
+        (r'^(Appendix\s+[A-Z])\s*[-:]?\s*(.{0,60})$', 'appendix'),
+        (r'^(Annex\s+[A-Z0-9])\s*[-:]?\s*(.{0,60})$', 'appendix'),
+        
+        # Chapter/Section keywords
+        (r'^(Chapter\s+\d{1,2})\s*[-:]?\s*(.{2,60})$', 'major'),
+        (r'^(Section\s+\d{1,2})\s*[-:]?\s*(.{2,60})$', 'major'),
     ]
     
-    for pattern in patterns:
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+    # Patterns that should NOT be treated as sections (false positives)
+    EXCLUDE_PATTERNS = [
+        r'^\d+\s*(Hz|kHz|MHz|GHz)',  # Frequencies
+        r'^\d+\s*(V|kV|mV)',          # Voltages  
+        r'^\d+\s*(A|mA|kA)',          # Currents
+        r'^\d+\s*(W|kW|MW)',          # Power
+        r'^\d+\s*(mm|cm|m|km)',       # Length
+        r'^\d+\s*(°|degrees?|C|F)',   # Temperature/angles
+        r'^\d+\.\d+\.\d+\s+\w',       # IP addresses or version numbers in text
+        r'^\d+\s+(of|de|from|to|and|or|the|a|an)\s',  # Numbers at start of sentences
+        r'^\d+\.\d+\s+(of|de|from|to|and|or|the|a|an|is|are|was|were|shall|should|must|may)\s',  # Numbered list items in sentences
+    ]
     
-    return None
-
-
-def format_table_as_chunk(table_data: Dict, page_num: int, file_name: str) -> Dict:
-    """
-    Format extracted table as a chunk with proper metadata.
-    """
-    caption = table_data.get('caption', '')
-    table_text = table_data.get('text', '')
+    def __init__(self):
+        self.hierarchy = []  # List of (section_number, title) tuples
+        self.last_section_number = None
     
-    # Create searchable chunk text with caption
-    if caption:
-        chunk_text = f"{caption}\n\n{table_text}"
-    else:
-        chunk_text = f"[Table with {table_data['rows']} rows x {table_data['cols']} columns]\n\n{table_text}"
-    
-    return {
-        'text': chunk_text,
-        'content_type': 'table',
-        'page_num': page_num,
-        'caption': caption,
-        'rows': table_data['rows'],
-        'cols': table_data['cols'],
-    }
-
-
-# =========================================================
-# NEW: FIGURE CAPTION EXTRACTION AND LINKING
-# =========================================================
-
-FIGURE_CAPTION_PATTERN = re.compile(
-    r'(Figure\s+\d+(?:\.\d+)?[.:]\s*[^\n]{5,150})',
-    re.IGNORECASE
-)
-
-def extract_figure_captions(text: str) -> List[Dict]:
-    """
-    Extract figure captions from text.
-    Returns list of {'caption': str, 'figure_num': str, 'position': int}
-    """
-    captions = []
-    
-    for match in FIGURE_CAPTION_PATTERN.finditer(text):
-        caption_text = match.group(1).strip()
+    def is_valid_section_header(self, text: str) -> Tuple[bool, Optional[str], Optional[str], str]:
+        """
+        Check if text is a valid section header.
         
-        # Extract figure number
-        fig_num_match = re.search(r'Figure\s+(\d+(?:\.\d+)?)', caption_text, re.IGNORECASE)
-        fig_num = fig_num_match.group(1) if fig_num_match else "unknown"
+        Returns:
+            (is_valid, section_number, title, section_type)
+        """
+        text = text.strip()
         
-        captions.append({
-            'caption': caption_text,
-            'figure_num': fig_num,
-            'position': match.start()
-        })
-    
-    return captions
-
-
-def link_figures_to_context(text: str, chunk_size: int = 500) -> List[Dict]:
-    """
-    Extract figure captions with surrounding context for better search.
-    Returns list of figure chunks with context.
-    """
-    figure_chunks = []
-    captions = extract_figure_captions(text)
-    
-    for cap_info in captions:
-        pos = cap_info['position']
-        caption = cap_info['caption']
+        # Quick reject: too short or too long
+        if len(text) < 3 or len(text) > 80:
+            return (False, None, None, '')
         
-        # Get context before and after the caption
-        context_start = max(0, pos - chunk_size // 2)
-        context_end = min(len(text), pos + len(caption) + chunk_size // 2)
+        # Quick reject: starts with lowercase
+        if text[0].islower():
+            return (False, None, None, '')
         
-        # Try to align to sentence boundaries
-        before_text = text[context_start:pos]
-        after_text = text[pos + len(caption):context_end]
+        # Check exclusion patterns first
+        for pattern in self.EXCLUDE_PATTERNS:
+            if re.match(pattern, text, re.IGNORECASE):
+                return (False, None, None, '')
         
-        # Find sentence start
-        sentence_start = before_text.rfind('. ')
-        if sentence_start != -1:
-            before_text = before_text[sentence_start + 2:]
-        
-        # Find sentence end
-        sentence_end = after_text.find('. ')
-        if sentence_end != -1:
-            after_text = after_text[:sentence_end + 1]
-        
-        context_text = f"{before_text.strip()} {caption} {after_text.strip()}"
-        
-        figure_chunks.append({
-            'text': context_text.strip(),
-            'content_type': 'figure',
-            'caption': caption,
-            'figure_num': cap_info['figure_num'],
-        })
-    
-    return figure_chunks
-
-
-# =========================================================
-# NEW: READING ORDER CORRECTION FOR MULTI-COLUMN LAYOUTS
-# =========================================================
-
-def sort_by_reading_order(detections: List[Dict], page_width: int = None) -> List[Dict]:
-    """
-    Sort OCR detections by reading order.
-    Handles multi-column layouts by detecting columns and sorting within each.
-    
-    Args:
-        detections: List of dicts with 'text', 'bbox' (x0, y0, x1, y1)
-        page_width: Page width to detect column boundaries
-    
-    Returns:
-        Sorted list of detections in reading order
-    """
-    if not detections:
-        return detections
-    
-    # If no bbox info, return as-is (already in OCR reading order)
-    if 'bbox' not in detections[0]:
-        return detections
-    
-    # Detect if multi-column based on x-positions
-    x_positions = [d['bbox'][0] for d in detections if 'bbox' in d]
-    
-    if not x_positions:
-        return detections
-    
-    # Use clustering to detect columns
-    x_positions_sorted = sorted(set(x_positions))
-    
-    # Simple heuristic: if there's a gap > 30% of page width, it's multi-column
-    if page_width is None:
-        page_width = max(d['bbox'][2] for d in detections if 'bbox' in d)
-    
-    column_gap_threshold = page_width * 0.15  # 15% gap indicates column
-    
-    columns = [[]]
-    prev_x = x_positions_sorted[0] if x_positions_sorted else 0
-    
-    for x in x_positions_sorted:
-        if x - prev_x > column_gap_threshold:
-            columns.append([])
-        columns[-1].append(x)
-        prev_x = x
-    
-    # If 2+ columns detected, sort by column then by Y position
-    if len(columns) >= 2:
-        column_boundaries = []
-        for col in columns:
-            if col:
-                column_boundaries.append((min(col), max(col)))
-        
-        def get_column_index(bbox):
-            x = bbox[0]
-            for i, (col_min, col_max) in enumerate(column_boundaries):
-                if col_min - 50 <= x <= col_max + 50:
-                    return i
-            return 0
-        
-        # Sort by: column index first, then Y position
-        detections_sorted = sorted(
-            detections,
-            key=lambda d: (get_column_index(d.get('bbox', [0,0,0,0])), 
-                          d.get('bbox', [0,0,0,0])[1])  # y0
-        )
-        return detections_sorted
-    
-    # Single column - just sort by Y position
-    return sorted(detections, key=lambda d: d.get('bbox', [0,0,0,0])[1])
-
-
-def split_into_sections(text: str) -> List[Dict]:
-    """
-    Split text into logical sections based on headers
-    Returns: List of dicts with 'header', 'content', 'section_num'
-    """
-    headers = detect_section_headers(text)
-    
-    if not headers:
-        # No clear sections found, return as single section
-        return [{
-            'header': None,
-            'section_num': None,
-            'content': text,
-            'start_pos': 0,
-            'end_pos': len(text)
-        }]
-    
-    sections = []
-    for i, (section_num, header_text, pos) in enumerate(headers):
-        # Find where this section ends (start of next section or end of text)
-        if i < len(headers) - 1:
-            end_pos = headers[i + 1][2]
-        else:
-            end_pos = len(text)
-        
-        # Extract content for this section
-        content = text[pos:end_pos].strip()
-        
-        sections.append({
-            'header': header_text,
-            'section_num': section_num,
-            'content': content,
-            'start_pos': pos,
-            'end_pos': end_pos
-        })
-    
-    return sections
-
-
-# =========================================================
-# NEW: SMART CHUNKING WITH STRUCTURE AWARENESS
-# =========================================================
-
-def chunk_page_text(page_text: str, page_num: int, chunk_size: int = CHUNK_SIZE, 
-                    overlap: int = CHUNK_OVERLAP) -> List[Dict]:
-    """
-    Chunk a single page's text while respecting structure.
-    Each chunk gets the correct page number directly.
-    
-    Returns: List of dicts with 'text', 'section_num', 'header', 'page_num', 'continues_to_next'
-    """
-    if not page_text or not page_text.strip():
-        return []
-    
-    # Detect sections within this page
-    sections = split_into_sections(page_text)
-    
-    chunks = []
-    
-    for section in sections:
-        section_num = section.get('section_num')
-        section_header = section.get('header')
-        section_content = section.get('content', '')
-        
-        # If section fits in one chunk, keep it together
-        if len(section_content) <= chunk_size:
-            if section_header:
-                chunk_text = f"{section_num} {section_header}\n\n{section_content}"
-            else:
-                chunk_text = section_content
-            
-            chunks.append({
-                'text': chunk_text.strip(),
-                'section_num': section_num,
-                'header': section_header,
-                'page_num': page_num,
-                'is_complete_section': True,
-                'continues_to_next': False
-            })
-            continue
-        
-        # Section too large - split by paragraphs
-        paragraphs = [p.strip() for p in section_content.split('\n\n') if p.strip()]
-        
-        if not paragraphs:
-            continue
-        
-        current_chunk_text = []
-        current_length = 0
-        
-        # Always start with section header
-        if section_header:
-            header_line = f"{section_num} {section_header}\n\n"
-            current_chunk_text.append(header_line)
-            current_length += len(header_line)
-        
-        for para_idx, para in enumerate(paragraphs):
-            para_len = len(para)
-            
-            # If adding this para exceeds chunk size
-            if current_length + para_len > chunk_size and current_chunk_text:
-                # Save current chunk
-                chunks.append({
-                    'text': ''.join(current_chunk_text).strip(),
-                    'section_num': section_num,
-                    'header': section_header,
-                    'page_num': page_num,
-                    'is_complete_section': False,
-                    'continues_to_next': False
-                })
+        # Check valid section patterns
+        for pattern, section_type in self.VALID_SECTION_PATTERNS:
+            match = re.match(pattern, text, re.IGNORECASE)
+            if match:
+                section_num = match.group(1).strip()
+                title = match.group(2).strip() if match.lastindex >= 2 else ''
                 
-                # Get overlap content
-                overlap_content = []
-                overlap_size = 0
-                for prev_para in reversed(current_chunk_text):
-                    if overlap_size + len(prev_para) <= overlap:
-                        overlap_content.insert(0, prev_para)
-                        overlap_size += len(prev_para)
-                    else:
-                        break
-                
-                # Start new chunk with overlap
-                current_chunk_text = []
-                current_length = 0
-                
-                if section_header:
-                    header_line = f"{section_num} {section_header}\n\n"
-                    current_chunk_text.append(header_line)
-                    current_length += len(header_line)
-                
-                for overlap_para in overlap_content:
-                    current_chunk_text.append(overlap_para)
-                    current_length += len(overlap_para)
-            
-            current_chunk_text.append(para + '\n\n')
-            current_length += para_len
-        
-        # Save remaining chunk
-        if current_chunk_text:
-            chunks.append({
-                'text': ''.join(current_chunk_text).strip(),
-                'section_num': section_num,
-                'header': section_header,
-                'page_num': page_num,
-                'is_complete_section': False,
-                'continues_to_next': False
-            })
-    
-    return chunks
-
-
-def chunk_with_cross_page_awareness(pages: List[Dict], chunk_size: int = CHUNK_SIZE, 
-                                    overlap: int = CHUNK_OVERLAP) -> List[Dict]:
-    """
-    Chunk text page-by-page, tracking when content spans pages.
-    
-    Args:
-        pages: List of {'page_num': int, 'text': str, ...} from OCR
-        chunk_size: Max chars per chunk
-        overlap: Overlap between chunks
-    
-    Returns:
-        List of chunks with accurate page_num and cross-page info
-    """
-    all_chunks = []
-    
-    for page_idx, page in enumerate(pages):
-        page_num = page['page_num']
-        page_text = page['text']
-        
-        # Get chunks from this page
-        page_chunks = chunk_page_text(page_text, page_num, chunk_size, overlap)
-        
-        # Check if content might continue from previous page
-        # (starts mid-sentence or lowercase)
-        if page_idx > 0 and page_text.strip():
-            first_char = page_text.strip()[0]
-            starts_mid_sentence = first_char.islower() or first_char in ',;'
-            
-            if starts_mid_sentence and page_chunks:
-                page_chunks[0]['continues_from_previous'] = True
-        
-        # Check if last chunk might continue to next page
-        # (ends mid-sentence)
-        if page_chunks and page_text.strip():
-            last_text = page_text.strip()
-            ends_mid_sentence = not last_text[-1] in '.!?"\''
-            
-            if ends_mid_sentence:
-                page_chunks[-1]['continues_to_next'] = True
-        
-        all_chunks.extend(page_chunks)
-    
-    return all_chunks
-
-
-# =========================================================
-# ENHANCED OCR CLASS
-# =========================================================
-
-class EnhancedTextDetection:
-    def __init__(self) -> None:
-        self.ocr = None
-        self.stats = {
-            'files': 0, 
-            'pages': 0, 
-            'words': 0,
-            'low_confidence_pages': 0,
-            'avg_confidence': []
-        }
-
-    def initPaddle(self, det_limit=1920, use_gpu=True) -> None:
-        """Initialize PaddleOCR"""
-        self.ocr = PaddleOCR(
-            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
-            use_textline_orientation=True,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            text_det_limit_type='max',
-            text_det_limit_side_len=det_limit,
-            text_det_thresh=0.3,
-            text_det_box_thresh=0.6,
-            text_recognition_batch_size=16,
-        )
-        logger.info(f"✓ PaddleOCR initialized on {'GPU' if use_gpu else 'CPU'}")
-
-    def split_into_tiles(self, img, num_tiles=2, overlap=50):
-        """Split image into tiles"""
-        h, w = img.shape[:2]
-        
-        if num_tiles == 1:
-            return [(img, 0, 0)]
-        elif num_tiles == 2:
-            mid_y = h // 2
-            return [
-                (img[0:mid_y + overlap, :], 0, 0),
-                (img[mid_y - overlap:h, :], 0, mid_y - overlap)
-            ]
-        elif num_tiles == 4:
-            mid_y, mid_x = h // 2, w // 2
-            return [
-                (img[0:mid_y + overlap, 0:mid_x + overlap], 0, 0),
-                (img[0:mid_y + overlap, mid_x - overlap:w], mid_x - overlap, 0),
-                (img[mid_y - overlap:h, 0:mid_x + overlap], 0, mid_y - overlap),
-                (img[mid_y - overlap:h, mid_x - overlap:w], mid_x - overlap, mid_y - overlap)
-            ]
-        else:
-            raise ValueError(f"num_tiles must be 1, 2 or 4")
-
-    def process_tile(self, tile_data):
-        """Process single tile"""
-        tile, offset_x, offset_y, tile_idx = tile_data
-        result = self.ocr.predict(tile)
-        return result, offset_x, offset_y, tile_idx
-
-    def adjust_coordinates(self, poly, offset_x, offset_y):
-        """Adjust coordinates to full image space"""
-        return [[float(pt[0]) + offset_x, float(pt[1]) + offset_y] for pt in poly]
-
-    def merge_results(self, tile_results, overlap, num_tiles):
-        """Merge results from tiles with bounding box info for reading order"""
-        merged = []
-        confidences = []
-        
-        for result, offset_x, offset_y, tile_idx in tile_results:
-            if not result or not result[0]:
-                continue
-            
-            for res in result:
-                texts = res.get('rec_texts', []) if isinstance(res, dict) else getattr(res, 'rec_texts', [])
-                scores = res.get('rec_scores', []) if isinstance(res, dict) else getattr(res, 'rec_scores', [])
-                polys = res.get('rec_polys', []) if isinstance(res, dict) else getattr(res, 'rec_polys', [])
-                
-                if not texts:
+                # Additional validation: title should have actual words
+                if title and len(title.split()) < 1:
                     continue
                 
-                for j, text in enumerate(texts):
-                    if not text or not str(text).strip():
-                        continue
-                    
-                    score = scores[j] if j < len(scores) else 0.0
-                    poly = polys[j] if j < len(polys) else None
-                    
-                    if poly is None:
-                        continue
-                    
-                    adjusted_box = self.adjust_coordinates(poly, offset_x, offset_y)
-                    
-                    # Skip overlap regions
-                    if num_tiles > 1 and tile_idx > 0:
-                        center_y = sum(pt[1] for pt in adjusted_box) / 4
-                        if num_tiles == 2 and tile_idx == 1 and center_y < offset_y + overlap:
-                            continue
-                        if num_tiles == 4:
-                            center_x = sum(pt[0] for pt in adjusted_box) / 4
-                            if tile_idx == 1 and center_x < offset_x + overlap:
-                                continue
-                            if tile_idx == 2 and center_y < offset_y + overlap:
-                                continue
-                            if tile_idx == 3 and (center_x < offset_x + overlap or center_y < offset_y + overlap):
-                                continue
-                    
-                    # Calculate bounding box from polygon (x0, y0, x1, y1)
-                    xs = [pt[0] for pt in adjusted_box]
-                    ys = [pt[1] for pt in adjusted_box]
-                    bbox = [min(xs), min(ys), max(xs), max(ys)]
-                    
-                    merged.append({
-                        "text": str(text),
-                        "confidence": float(score),
-                        "bbox": bbox,  # Include bbox for reading order sorting
-                    })
-                    confidences.append(float(score))
+                return (True, section_num, title, section_type)
         
-        return merged, confidences
+        return (False, None, None, '')
+    
+    def update(self, text: str) -> Tuple[bool, Optional[str], int]:
+        """
+        Try to update hierarchy with text.
+        
+        Returns:
+            (was_updated, section_number, level)
+        """
+        is_valid, section_num, title, section_type = self.is_valid_section_header(text)
+        
+        if not is_valid:
+            return (False, None, 0)
+        
+        # Determine hierarchy level
+        if section_type == 'major' or section_type == 'appendix':
+            level = 1
+        elif section_type == 'sub':
+            level = 2
+        elif section_type == 'subsub':
+            level = 3
+        else:
+            level = section_num.count('.') + 1
+        
+        # Build hierarchy entry
+        entry = f"{section_num} {title}".strip() if title else section_num
+        
+        # Update hierarchy - trim to current level and append
+        self.hierarchy = self.hierarchy[:level-1]
+        self.hierarchy.append(entry)
+        self.last_section_number = section_num
+        
+        return (True, section_num, level)
+    
+    def get_hierarchy(self) -> List[str]:
+        """Get current section hierarchy as list."""
+        return self.hierarchy.copy()
+    
+    def get_current_section(self) -> Optional[str]:
+        """Get current section number."""
+        return self.last_section_number
+    
+    def reset(self):
+        """Reset hierarchy for new document."""
+        self.hierarchy = []
+        self.last_section_number = None
 
-    def process_pdf_pages(self, file_path: str, num_tiles: int = 2, dpi: int = 200, 
-                          first_page_only: bool = False, resize_large: bool = True) -> List[Dict]:
-        """Process PDF pages and return structured text"""
-        try:
-            images = convert_from_path(file_path, dpi=dpi)
-        except Exception as e:
-            logger.error(f"Failed to convert PDF {file_path}: {e}")
+
+class TableDetector:
+    """
+    Detects and extracts table structure using bounding box coordinates.
+    Groups text blocks into rows and columns based on spatial alignment.
+    """
+    
+    # Table header indicators
+    TABLE_HEADER_PATTERNS = [
+        r'^Table\s+\d+',
+        r'^Tabela\s+\d+',
+        r'^Tab\.\s*\d+',
+        r'^TABLE\s+\d+',
+    ]
+    
+    def __init__(self, row_tolerance: int = 15, col_tolerance: int = 30):
+        """
+        Args:
+            row_tolerance: Y-coordinate tolerance for grouping into same row
+            col_tolerance: X-coordinate tolerance for grouping into same column
+        """
+        self.row_tolerance = row_tolerance
+        self.col_tolerance = col_tolerance
+    
+    def is_table_header(self, text: str) -> bool:
+        """Check if text is a table caption/header."""
+        for pattern in self.TABLE_HEADER_PATTERNS:
+            if re.match(pattern, text.strip(), re.IGNORECASE):
+                return True
+        return False
+    
+    def detect_table_region(self, blocks: List[Dict], start_idx: int) -> Tuple[int, List[Dict]]:
+        """
+        Detect table region starting from a table header.
+        
+        Returns:
+            (end_index, table_blocks)
+        """
+        table_blocks = []
+        
+        if start_idx >= len(blocks):
+            return start_idx, []
+        
+        # Get table header position
+        header_block = blocks[start_idx]
+        header_bbox = header_block.get('bbox')
+        
+        if not header_bbox:
+            return start_idx + 1, []
+        
+        header_y = header_bbox[1]  # Top of header
+        
+        # Collect blocks that appear to be part of the table
+        # Tables typically have consistent left margins and grid-like structure
+        i = start_idx + 1
+        last_y = header_y
+        
+        while i < len(blocks):
+            block = blocks[i]
+            bbox = block.get('bbox')
+            
+            if not bbox:
+                i += 1
+                continue
+            
+            y_top = bbox[1]
+            
+            # If we've moved significantly down and hit what looks like a new section, stop
+            if y_top - last_y > 100:  # Large vertical gap
+                # Check if next text looks like a section header or regular paragraph
+                text = block.get('text', '')
+                if len(text) > 100 or text[0].islower() if text else True:
+                    break
+            
+            # Check if this looks like table content (short text, aligned)
+            text = block.get('text', '')
+            if len(text) > 200:  # Too long for table cell
+                break
+            
+            table_blocks.append(block)
+            last_y = y_top
+            i += 1
+            
+            # Limit table size
+            if len(table_blocks) > 50:
+                break
+        
+        return i, table_blocks
+    
+    def extract_table_structure(self, blocks: List[Dict], header_text: str) -> Dict:
+        """
+        Extract table structure from blocks.
+        
+        Returns:
+            {
+                'table_header': str,
+                'table_data': {'row,col': 'cell_text', ...},
+                'rows': int,
+                'cols': int
+            }
+        """
+        if not blocks:
+            return {
+                'table_header': header_text,
+                'table_data': {},
+                'rows': 0,
+                'cols': 0
+            }
+        
+        # Group blocks by rows (similar Y coordinates)
+        rows = self._group_by_rows(blocks)
+        
+        if not rows:
+            return {
+                'table_header': header_text,
+                'table_data': {},
+                'rows': 0,
+                'cols': 0
+            }
+        
+        # Determine column positions
+        col_positions = self._find_column_positions(rows)
+        
+        # Build table data
+        table_data = {}
+        for row_idx, row_blocks in enumerate(rows):
+            for block in row_blocks:
+                bbox = block.get('bbox')
+                if not bbox:
+                    continue
+                
+                x_center = (bbox[0] + bbox[2]) / 2
+                col_idx = self._find_column_index(x_center, col_positions)
+                
+                key = f"{col_idx},{row_idx}"
+                text = block.get('text', '').strip()
+                
+                if key in table_data:
+                    table_data[key] += ' ' + text
+                else:
+                    table_data[key] = text
+        
+        return {
+            'table_header': header_text,
+            'table_data': table_data,
+            'rows': len(rows),
+            'cols': len(col_positions)
+        }
+    
+    def _group_by_rows(self, blocks: List[Dict]) -> List[List[Dict]]:
+        """Group blocks into rows based on Y coordinate."""
+        if not blocks:
             return []
         
-        pages_data = []
-        num_images = len(images)
-        pages_to_process = [1] if first_page_only else range(1, num_images + 1)
+        # Sort by Y coordinate
+        sorted_blocks = sorted(blocks, key=lambda b: b.get('bbox', [0, 0, 0, 0])[1])
         
-        for page_num in pages_to_process:
-            pil_image = images[page_num - 1]
-            img = np.array(pil_image)
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            page_width = img_bgr.shape[1]  # Get page width for column detection
+        rows = []
+        current_row = []
+        current_y = None
+        
+        for block in sorted_blocks:
+            bbox = block.get('bbox')
+            if not bbox:
+                continue
             
-            if resize_large:
-                img_bgr = resize_if_large(img_bgr, MAX_SHORT_SIDE)
+            y = bbox[1]
             
-            tiles = self.split_into_tiles(img_bgr, num_tiles, overlap=50)
-            tile_data = [(tile, ox, oy, i) for i, (tile, ox, oy) in enumerate(tiles)]
+            if current_y is None or abs(y - current_y) <= self.row_tolerance:
+                current_row.append(block)
+                if current_y is None:
+                    current_y = y
+            else:
+                if current_row:
+                    # Sort row by X coordinate
+                    current_row.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
+                    rows.append(current_row)
+                current_row = [block]
+                current_y = y
+        
+        if current_row:
+            current_row.sort(key=lambda b: b.get('bbox', [0, 0, 0, 0])[0])
+            rows.append(current_row)
+        
+        return rows
+    
+    def _find_column_positions(self, rows: List[List[Dict]]) -> List[int]:
+        """Find column X positions from all rows."""
+        all_x_positions = []
+        
+        for row in rows:
+            for block in row:
+                bbox = block.get('bbox')
+                if bbox:
+                    all_x_positions.append(bbox[0])  # Left edge
+        
+        if not all_x_positions:
+            return []
+        
+        # Cluster X positions into columns
+        all_x_positions.sort()
+        columns = []
+        current_col = all_x_positions[0]
+        
+        for x in all_x_positions:
+            if abs(x - current_col) > self.col_tolerance:
+                columns.append(current_col)
+                current_col = x
+        columns.append(current_col)
+        
+        return columns
+    
+    def _find_column_index(self, x: float, col_positions: List[int]) -> int:
+        """Find which column a given X coordinate belongs to."""
+        if not col_positions:
+            return 0
+        
+        for i, col_x in enumerate(col_positions):
+            if x < col_x + self.col_tolerance:
+                return i
+        
+        return len(col_positions) - 1
+
+
+class StructureAnalyzer:
+    """
+    Analyzes OCR text to detect document structure.
+    Uses strict validation for section headers.
+    """
+    
+    def __init__(self):
+        self.hierarchy_tracker = SectionHierarchyTracker()
+        self.table_detector = TableDetector()
+    
+    def classify_block(self, text: str, is_first_page: bool = False) -> Tuple[str, Optional[str], int]:
+        """
+        Classify a text block.
+        
+        Returns:
+            (block_type, section_number, level)
+        """
+        text_stripped = text.strip()
+        
+        # Check for table headers first
+        if self.table_detector.is_table_header(text_stripped):
+            return ("table_header", None, 0)
+        
+        # Check for section headers with strict validation
+        was_updated, section_num, level = self.hierarchy_tracker.update(text_stripped)
+        if was_updated:
+            block_type = "section_header" if level == 1 else "subsection_header"
+            return (block_type, section_num, level)
+        
+        # Title detection (first page, short text, capitalized)
+        if is_first_page and len(text_stripped.split()) <= 8 and len(text_stripped) > 3:
+            words = text_stripped.split()
+            if words and words[0][0].isupper():
+                # Make sure it's not a common header/footer
+                if not self._is_page_element(text_stripped):
+                    return ("title", None, 0)
+        
+        # Page elements (headers/footers) - filter these out
+        if self._is_page_element(text_stripped):
+            return ("page_element", None, 0)
+        
+        return ("body", None, 0)
+    
+    def _is_page_element(self, text: str) -> bool:
+        """Check if text is a page header/footer."""
+        text_lower = text.lower().strip()
+        
+        # Page numbers
+        if re.match(r'^page\s*\d+', text_lower):
+            return True
+        if re.match(r'^\d+\s*(of|de)\s*\d+$', text_lower):
+            return True
+        if re.match(r'^\d+$', text_lower) and len(text_lower) <= 4:
+            return True
+        
+        # Common footer/header patterns
+        footer_keywords = [
+            'confidential', 'internal', 'uncontrolled', 'copyright', '©',
+            'página', 'all rights reserved', 'proprietary', 'draft',
+            'transmission', 'electricity networks'
+        ]
+        
+        if len(text.split()) <= 10:
+            text_check = text_lower
+            if any(kw in text_check for kw in footer_keywords):
+                return True
+        
+        return False
+    
+    def get_hierarchy(self) -> List[str]:
+        return self.hierarchy_tracker.get_hierarchy()
+    
+    def get_current_section(self) -> Optional[str]:
+        return self.hierarchy_tracker.get_current_section()
+    
+    def reset(self):
+        self.hierarchy_tracker.reset()
+
+
+class DocumentExtractor:
+    """Extracts structured text from PDFs using PPOCRv5."""
+    
+    def __init__(self, dpi: int = DPI):
+        self.ocr = None
+        self.dpi = dpi
+        self.structure_analyzer = StructureAnalyzer()
+        self.table_detector = TableDetector()
+        self.stats = {
+            'pages': 0,
+            'text_blocks': 0,
+            'sections': 0,
+            'tables': 0,
+            'avg_confidence': 0.0
+        }
+    
+    def init_ocr(self):
+        """Initialize PPOCRv5 optimized for RTX GPU."""
+        if self.ocr is not None:
+            return
+        
+        logger.info("Initializing PPOCRv5...")
+        try:
+            self.ocr = PaddleOCR(
+                lang='latin',
+                ocr_version='PP-OCRv5',
+                text_detection_model_name="PP-OCRv5_server_det",
+                text_recognition_model_name="PP-OCRv5_server_rec",
+                text_det_limit_side_len=1920,
+                text_det_limit_type='max',
+                text_det_thresh=0.3,
+                text_det_box_thresh=0.5,
+                text_det_unclip_ratio=1.6,
+                text_rec_score_thresh=0.5,
+                text_recognition_batch_size=16,
+                use_doc_orientation_classify=False,
+                use_textline_orientation=True,
+                use_doc_unwarping=False,
+            )
+            logger.info("✓ PPOCRv5 initialized (server models, GPU)")
+        except Exception as e:
+            logger.warning(f"Server model failed: {e}")
+            self.ocr = PaddleOCR(
+                lang='latin',
+                ocr_version='PP-OCRv5',
+                use_textline_orientation=True,
+            )
+            logger.info("✓ PPOCRv5 initialized (default)")
+    
+    def cleanup(self):
+        if self.ocr:
+            del self.ocr
+            self.ocr = None
+            gc.collect()
+    
+    def _normalize_ocr_result(self, result: Any) -> List[Dict]:
+        """
+        Normalize PaddleOCR 3.3.2 result format.
+        
+        Returns list of: {'text': str, 'confidence': float, 'bbox': [x1,y1,x2,y2]}
+        """
+        normalized = []
+        
+        if not result:
+            return normalized
+        
+        # Handle list wrapper
+        data = result[0] if isinstance(result, list) and len(result) > 0 else result
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+        
+        # Extract from dict format (PaddleOCR 3.3.2)
+        if isinstance(data, dict):
+            rec_texts = data.get('rec_texts', [])
+            rec_scores = data.get('rec_scores', [])
+            rec_polys = data.get('rec_polys', [])
             
-            tile_results = [self.process_tile(td) for td in tile_data]
-            merged_results, confidences = self.merge_results(tile_results, 50, num_tiles)
-            
-            # Calculate average confidence for this page
-            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-            self.stats['avg_confidence'].append(avg_confidence)
-            
-            # Flag low confidence pages for manual review
-            if avg_confidence < 0.7:
-                self.stats['low_confidence_pages'] += 1
-                logger.warning(f"Low OCR confidence on page {page_num}: {avg_confidence:.2f}")
-            
-            # NEW: Sort by reading order (handles multi-column layouts)
-            sorted_results = sort_by_reading_order(merged_results, page_width)
-            
-            valid_detections = [
-                detection for detection in sorted_results 
-                if is_valid_text(detection.get("text", "").strip())
-            ]
-            
-            # Join texts - use double newline between groups for paragraph structure
-            # Group consecutive short lines (likely lists/tables) vs paragraphs
-            grouped_text = []
-            current_group = []
-            
-            for detection in valid_detections:
-                text = detection["text"].strip()
-                current_group.append(text)
-                # If text ends with sentence-ending punctuation, close the group
-                if text.rstrip().endswith(('.', '!', '?', ':')):
-                    grouped_text.append(' '.join(current_group))
-                    current_group = []
-            
-            # Don't forget remaining text
-            if current_group:
-                grouped_text.append(' '.join(current_group))
-            
-            page_text = '\n\n'.join(grouped_text)
-            word_count = len(page_text.split())
-            
-            if word_count >= MIN_WORDS_FOR_PAGE:
-                pages_data.append({
-                    'page_num': page_num,
-                    'text': page_text,
-                    'word_count': word_count,
-                    'avg_confidence': avg_confidence,
-                    'low_confidence_warning': avg_confidence < 0.7
+            for i, text in enumerate(rec_texts):
+                if not text or not str(text).strip():
+                    continue
+                
+                conf = float(rec_scores[i]) if i < len(rec_scores) else 0.5
+                
+                # Extract bbox from polygon
+                bbox = None
+                if i < len(rec_polys):
+                    poly = rec_polys[i]
+                    try:
+                        xs = [int(p[0]) for p in poly]
+                        ys = [int(p[1]) for p in poly]
+                        bbox = [min(xs), min(ys), max(xs), max(ys)]
+                    except:
+                        pass
+                
+                normalized.append({
+                    'text': str(text).strip(),
+                    'confidence': conf,
+                    'bbox': bbox
                 })
+        
+        return normalized
+    
+    def process_page(self, img_bgr: np.ndarray, page_num: int,
+                     is_first_page: bool = False) -> Tuple[List[TextBlock], List[Dict], float]:
+        """
+        Process a single page image with OCR.
+        
+        Returns:
+            (blocks, table_data_list, avg_confidence)
+        """
+        try:
+            result = self.ocr.predict(img_bgr)
+        except Exception as e:
+            logger.error(f"OCR failed on page {page_num}: {e}")
+            return [], [], 0.0
+        
+        if not result:
+            return [], [], 0.0
+        
+        ocr_data = self._normalize_ocr_result(result)
+        
+        if not ocr_data:
+            return [], [], 0.0
+        
+        blocks = []
+        tables = []
+        confidences = []
+        
+        i = 0
+        while i < len(ocr_data):
+            item = ocr_data[i]
+            text = item['text']
+            conf = item['confidence']
+            bbox = item.get('bbox')
+            
+            if not text.strip():
+                i += 1
+                continue
+            
+            # Check for table
+            if self.table_detector.is_table_header(text):
+                # Extract table structure
+                end_idx, table_blocks = self.table_detector.detect_table_region(ocr_data, i)
+                table_structure = self.table_detector.extract_table_structure(table_blocks, text)
+                tables.append(table_structure)
+                
+                block = TextBlock(
+                    text=text.strip(),
+                    confidence=conf,
+                    line_index=i,
+                    block_type="table_header",
+                    bbox=bbox
+                )
+                blocks.append(block)
+                self.stats['tables'] += 1
+                
+                # Add table cells as body blocks (for text extraction)
+                for tb in table_blocks:
+                    blocks.append(TextBlock(
+                        text=tb['text'],
+                        confidence=tb['confidence'],
+                        line_index=len(blocks),
+                        block_type="table_cell",
+                        bbox=tb.get('bbox')
+                    ))
+                
+                i = end_idx
+                continue
+            
+            # Classify the block
+            block_type, section_num, level = self.structure_analyzer.classify_block(
+                text, is_first_page
+            )
+            
+            # Skip page elements
+            if block_type == "page_element":
+                i += 1
+                continue
+            
+            block = TextBlock(
+                text=text.strip(),
+                confidence=conf,
+                line_index=i,
+                block_type=block_type,
+                section_number=section_num,
+                level=level,
+                bbox=bbox
+            )
+            blocks.append(block)
+            confidences.append(conf)
+            
+            self.stats['text_blocks'] += 1
+            if block_type in ('section_header', 'subsection_header'):
+                self.stats['sections'] += 1
+            
+            i += 1
+        
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return blocks, tables, avg_conf
+    
+    def process_pdf(self, pdf_path: str) -> Tuple[List[Dict], Dict]:
+        """Process entire PDF and return structured page data."""
+        logger.info(f"Processing: {os.path.basename(pdf_path)}")
+        
+        self.structure_analyzer.reset()
+        
+        try:
+            images = convert_from_path(
+                pdf_path,
+                dpi=self.dpi,
+                fmt='jpeg',
+                thread_count=2
+            )
+        except Exception as e:
+            logger.error(f"PDF conversion failed: {e}")
+            return [], {'error': str(e)}
+        
+        pages_data = []
+        total_conf = 0.0
+        
+        for page_num, pil_img in enumerate(tqdm(images, desc="OCR pages", leave=False), start=1):
+            img_rgb = np.array(pil_img)
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            
+            is_first_page = (page_num == 1)
+            blocks, tables, confidence = self.process_page(img_bgr, page_num, is_first_page)
+            
+            if blocks:
+                pages_data.append({
+                    'page_number': page_num,
+                    'blocks': blocks,
+                    'tables': tables,
+                    'confidence': confidence,
+                    'section_hierarchy': self.structure_analyzer.get_hierarchy(),
+                    'current_section': self.structure_analyzer.get_current_section()
+                })
+                total_conf += confidence
             
             self.stats['pages'] += 1
-            self.stats['words'] += word_count
             
-            del img, img_bgr, tiles, tile_data, tile_results, merged_results, pil_image
+            del img_rgb, img_bgr, pil_img
+            gc.collect()
         
         del images
         gc.collect()
         
-        return pages_data
+        self.stats['avg_confidence'] = total_conf / len(pages_data) if pages_data else 0.0
+        
+        return pages_data, {'total_pages': len(pages_data)}
 
 
-# =========================================================
-# ENHANCED BUILD CHUNKS FUNCTION
-# =========================================================
+def get_parent_section(section_num: Optional[str]) -> Optional[str]:
+    """Get parent section number."""
+    if not section_num:
+        return None
+    parts = section_num.rsplit('.', 1)
+    return parts[0] if len(parts) > 1 else None
 
-def build_enhanced_chunks(pdf_path: str, source_folder: str, ocr_engine: EnhancedTextDetection,
-                         chunk_size: int, overlap: int, num_tiles: int, dpi: int,
-                         first_page_only: bool = False, resize_large: bool = True,
-                         extract_tables: bool = True) -> List[Dict]:
-    """
-    Build enhanced chunks with structure detection, table extraction, and figure linking.
+
+def create_chunks(
+    pages_data: List[Dict],
+    file_name: str,
+    source_folder: str,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> List[DocumentChunk]:
+    """Create document chunks from extracted page data."""
+    chunks = []
+    chunk_idx = 0
     
-    NEW FEATURES:
-    - Extracts tables separately using pdfplumber (preserves structure)
-    - Links figure captions to surrounding context
-    - Adds content_type field: 'text', 'table', 'figure'
-    """
+    # Track hierarchy independently during chunking
+    current_hierarchy = []
+    current_section_num = None
     
-    file_base = os.path.splitext(os.path.basename(pdf_path))[0].lower()
+    # Track tables by page
+    page_tables = {}
+    for page_data in pages_data:
+        page_num = page_data['page_number']
+        page_tables[page_num] = page_data.get('tables', [])
     
-    # ===== STEP 1: Extract tables with pdfplumber =====
-    table_chunks = []
-    tables_by_page = {}
+    current_table_idx = {}  # Track which table we're processing per page
     
-    if extract_tables and PDFPLUMBER_AVAILABLE:
-        try:
-            tables_by_page = extract_tables_from_pdf(pdf_path)
+    for page_data in pages_data:
+        page_num = page_data['page_number']
+        blocks = page_data['blocks']
+        tables = page_data.get('tables', [])
+        
+        current_text = []
+        table_idx = 0
+        in_table = False
+        current_table_data = None
+        
+        for block in blocks:
+            # Update hierarchy from section headers
+            if block.section_number:
+                current_section_num = block.section_number
+                level = block.level if block.level else block.section_number.count('.') + 1
+                current_hierarchy = current_hierarchy[:level-1]
+                title = re.sub(r'^[\d.A-Z]+\s*', '', block.text, flags=re.IGNORECASE).strip()
+                entry = f"{block.section_number} {title}".strip() if title else block.section_number
+                current_hierarchy.append(entry)
             
-            for page_num, page_tables in tables_by_page.items():
-                for table_idx, table_data in enumerate(page_tables):
-                    table_chunk = format_table_as_chunk(table_data, page_num, file_base)
+            # Handle table headers
+            if block.block_type == 'table_header':
+                # Save accumulated body text first
+                if current_text:
+                    text = '\n'.join(current_text)
+                    if text.strip():
+                        chunks.append(DocumentChunk(
+                            chunk_id=f"{file_name}__c{chunk_idx}",
+                            file_name=file_name,
+                            page_number=page_num,
+                            chunk_index=chunk_idx,
+                            chunk_text=text.strip(),
+                            word_count=len(text.split()),
+                            content_type="body",
+                            section_hierarchy=current_hierarchy.copy(),
+                            section_number=current_section_num,
+                            parent_section=get_parent_section(current_section_num),
+                            source_folder=source_folder
+                        ))
+                        chunk_idx += 1
+                    current_text = []
+                
+                # Get table data if available
+                if table_idx < len(tables):
+                    current_table_data = tables[table_idx]
+                    table_idx += 1
+                else:
+                    current_table_data = {'table_header': block.text, 'table_data': {}}
+                
+                in_table = True
+                continue
+            
+            # Handle table cells
+            if block.block_type == 'table_cell':
+                # Skip - table data is captured in table_data structure
+                continue
+            
+            # End table mode when we hit a non-table block
+            if in_table and block.block_type not in ('table_header', 'table_cell'):
+                # Create table chunk
+                if current_table_data:
+                    # Build table text representation
+                    table_text = f"{current_table_data.get('table_header', 'Table')}\n"
+                    td = current_table_data.get('table_data', {})
+                    if td:
+                        # Sort by row then column
+                        sorted_keys = sorted(td.keys(), key=lambda k: (int(k.split(',')[1]), int(k.split(',')[0])))
+                        current_row = -1
+                        for key in sorted_keys:
+                            col, row = map(int, key.split(','))
+                            if row != current_row:
+                                if current_row >= 0:
+                                    table_text += '\n'
+                                current_row = row
+                            else:
+                                table_text += ' | '
+                            table_text += td[key]
                     
-                    chunk_id = f"{file_base}__table_p{page_num}_t{table_idx}"
+                    chunks.append(DocumentChunk(
+                        chunk_id=f"{file_name}__c{chunk_idx}",
+                        file_name=file_name,
+                        page_number=page_num,
+                        chunk_index=chunk_idx,
+                        chunk_text=table_text.strip(),
+                        word_count=len(table_text.split()),
+                        content_type="table",
+                        section_hierarchy=current_hierarchy.copy(),
+                        section_number=current_section_num,
+                        parent_section=get_parent_section(current_section_num),
+                        has_table=True,
+                        table_data=current_table_data,
+                        source_folder=source_folder
+                    ))
+                    chunk_idx += 1
+                
+                in_table = False
+                current_table_data = None
+            
+            # Headers get their own chunks
+            if block.block_type in ('title', 'section_header', 'subsection_header'):
+                # Save accumulated body text first
+                if current_text:
+                    text = '\n'.join(current_text)
+                    if text.strip():
+                        chunks.append(DocumentChunk(
+                            chunk_id=f"{file_name}__c{chunk_idx}",
+                            file_name=file_name,
+                            page_number=page_num,
+                            chunk_index=chunk_idx,
+                            chunk_text=text.strip(),
+                            word_count=len(text.split()),
+                            content_type="body",
+                            section_hierarchy=current_hierarchy.copy(),
+                            section_number=current_section_num,
+                            parent_section=get_parent_section(current_section_num),
+                            source_folder=source_folder,
+                            confidence=block.confidence
+                        ))
+                        chunk_idx += 1
+                    current_text = []
+                
+                # Create header chunk
+                chunks.append(DocumentChunk(
+                    chunk_id=f"{file_name}__c{chunk_idx}",
+                    file_name=file_name,
+                    page_number=page_num,
+                    chunk_index=chunk_idx,
+                    chunk_text=block.text,
+                    word_count=len(block.text.split()),
+                    content_type=block.block_type,
+                    section_hierarchy=current_hierarchy.copy(),
+                    section_number=block.section_number,
+                    parent_section=get_parent_section(block.section_number),
+                    source_folder=source_folder,
+                    confidence=block.confidence
+                ))
+                chunk_idx += 1
+                
+            elif block.block_type == 'body':
+                # Accumulate body text
+                current_text.append(block.text)
+                
+                # Check if we need to create a chunk
+                combined = '\n'.join(current_text)
+                if len(combined) >= chunk_size:
+                    chunks.append(DocumentChunk(
+                        chunk_id=f"{file_name}__c{chunk_idx}",
+                        file_name=file_name,
+                        page_number=page_num,
+                        chunk_index=chunk_idx,
+                        chunk_text=combined.strip(),
+                        word_count=len(combined.split()),
+                        content_type="body",
+                        section_hierarchy=current_hierarchy.copy(),
+                        section_number=current_section_num,
+                        parent_section=get_parent_section(current_section_num),
+                        source_folder=source_folder,
+                        confidence=block.confidence
+                    ))
+                    chunk_idx += 1
                     
-                    table_chunks.append({
-                        "chunk_id": chunk_id,
-                        "file_name": file_base,
-                        "page_number": page_num,
-                        "chunk_index": f"table_{table_idx}",
-                        "chunk_text": table_chunk['text'],
-                        "word_count": len(table_chunk['text'].split()),
-                        "content_type": "table",
-                        "table_caption": table_chunk.get('caption'),
-                        "table_rows": table_chunk.get('rows'),
-                        "table_cols": table_chunk.get('cols'),
-                        "section_number": None,
-                        "section_header": None,
-                        "is_complete_section": True,
-                        "source_folder": source_folder,
-                        "doc_title": file_base,
-                        "text_source": "pdfplumber_table",
-                        "created_date": datetime.now().isoformat()
-                    })
-            
-            if table_chunks:
-                logger.info(f"  ✓ Extracted {len(table_chunks)} tables from {pdf_path}")
-                
-        except Exception as e:
-            logger.warning(f"Table extraction failed for {pdf_path}: {e}")
-    
-    # ===== STEP 2: OCR for regular text =====
-    pages = ocr_engine.process_pdf_pages(pdf_path, num_tiles=num_tiles, dpi=dpi, 
-                                        first_page_only=first_page_only,
-                                        resize_large=resize_large)
-    
-    if not pages:
-        return table_chunks  # Return any tables we found
-    
-    # Combine all pages into full text
-    full_text = '\n\n'.join(page['text'] for page in pages)
-    
-    # Detect document structure
-    structure = detect_structural_elements(full_text)
-    doc_code = structure.get('doc_code')
-    
-    # Build page offset map for figure page detection
-    page_offsets = []  # List of (start_offset, end_offset, page_num)
-    current_offset = 0
-    for page in pages:
-        page_len = len(page['text']) + 2  # +2 for '\n\n' separator
-        page_offsets.append((current_offset, current_offset + page_len, page['page_num']))
-        current_offset += page_len
-    
-    def find_page_for_position(pos: int) -> int:
-        """Find which page a text position belongs to"""
-        for start, end, pnum in page_offsets:
-            if start <= pos < end:
-                return pnum
-        return 1  # Default to page 1
-    
-    # ===== STEP 3: Extract figure captions with context =====
-    figure_chunks = []
-    figure_captions = extract_figure_captions(full_text)
-    
-    for fig_idx, fig_info in enumerate(figure_captions):
-        # Get context around figure
-        fig_context = link_figures_to_context(full_text)
+                    # Keep overlap
+                    overlap_text = combined[-overlap:] if len(combined) > overlap else ""
+                    current_text = [overlap_text] if overlap_text.strip() else []
         
-        for ctx_idx, ctx in enumerate(fig_context):
-            if ctx.get('figure_num') == fig_info['figure_num']:
-                chunk_id = f"{file_base}__figure_{fig_info['figure_num']}"
-                
-                # Find page number from the figure caption's position
-                fig_page = find_page_for_position(fig_info.get('position', 0))
-                
-                figure_chunks.append({
-                    "chunk_id": chunk_id,
-                    "file_name": file_base,
-                    "page_number": fig_page,
-                    "chunk_index": f"figure_{fig_idx}",
-                    "chunk_text": ctx['text'],
-                    "word_count": len(ctx['text'].split()),
-                    "content_type": "figure",
-                    "figure_caption": ctx.get('caption'),
-                    "figure_number": ctx.get('figure_num'),
-                    "section_number": None,
-                    "section_header": None,
-                    "is_complete_section": True,
-                    "document_code": doc_code,
-                    "source_folder": source_folder,
-                    "doc_title": file_base,
-                    "text_source": "ocr_figure_context",
-                    "created_date": datetime.now().isoformat()
-                })
-                break  # Only add once per figure
-    
-    if figure_chunks:
-        logger.info(f"  ✓ Extracted {len(figure_chunks)} figure contexts from {pdf_path}")
-    
-    # ===== STEP 4: Page-by-page smart chunking =====
-    # This is the key change: chunk each page individually, so page numbers are always accurate
-    structured_chunks = chunk_with_cross_page_awareness(pages, chunk_size, overlap)
-    
-    # Build output chunks with enhanced metadata
-    text_chunks = []
-    
-    for idx, chunk_info in enumerate(structured_chunks):
-        chunk_id = f"{file_base}__c{idx}"
-        chunk_text = chunk_info['text']
-        page_num = chunk_info['page_num']  # Directly from page-aware chunking
+        # End of page - save remaining content
+        if in_table and current_table_data:
+            # Save pending table
+            table_text = f"{current_table_data.get('table_header', 'Table')}\n"
+            td = current_table_data.get('table_data', {})
+            if td:
+                sorted_keys = sorted(td.keys(), key=lambda k: (int(k.split(',')[1]), int(k.split(',')[0])))
+                current_row = -1
+                for key in sorted_keys:
+                    col, row = map(int, key.split(','))
+                    if row != current_row:
+                        if current_row >= 0:
+                            table_text += '\n'
+                        current_row = row
+                    else:
+                        table_text += ' | '
+                    table_text += td[key]
+            
+            chunks.append(DocumentChunk(
+                chunk_id=f"{file_name}__c{chunk_idx}",
+                file_name=file_name,
+                page_number=page_num,
+                chunk_index=chunk_idx,
+                chunk_text=table_text.strip(),
+                word_count=len(table_text.split()),
+                content_type="table",
+                section_hierarchy=current_hierarchy.copy(),
+                section_number=current_section_num,
+                parent_section=get_parent_section(current_section_num),
+                has_table=True,
+                table_data=current_table_data,
+                source_folder=source_folder
+            ))
+            chunk_idx += 1
         
-        # Determine content type based on content
-        content_type = "text"
-        if TABLE_MARKER.search(chunk_text):
-            content_type = "text_with_table_ref"
-        elif FIGURE_MARKER.search(chunk_text):
-            content_type = "text_with_figure_ref"
-        
-        chunk_data = {
-            "chunk_id": chunk_id,
-            "file_name": file_base,
-            "page_number": page_num,
-            "chunk_index": idx,
-            "chunk_text": chunk_text,
-            "word_count": len(chunk_text.split()),
-            "content_type": content_type,
-            
-            # Structure metadata
-            "section_number": chunk_info.get('section_num'),
-            "section_header": chunk_info.get('header'),
-            "is_complete_section": chunk_info.get('is_complete_section', False),
-            
-            # Cross-page info (helpful for RAG context)
-            "continues_from_previous": chunk_info.get('continues_from_previous', False),
-            "continues_to_next": chunk_info.get('continues_to_next', False),
-            
-            # Document metadata
-            "document_code": doc_code,
-            "has_table": structure['has_table'],
-            "has_figure": structure['has_figure'],
-            "has_appendix": structure['has_appendix'],
-            "doc_references": structure.get('doc_references', []),
-            
-            # Original metadata
-            "source_folder": source_folder,
-            "doc_title": file_base,
-            "text_source": "paddleocr_v5_enhanced",
-            "created_date": datetime.now().isoformat()
-        }
-        
-        text_chunks.append(chunk_data)
+        if current_text:
+            text = '\n'.join(current_text)
+            if text.strip():
+                chunks.append(DocumentChunk(
+                    chunk_id=f"{file_name}__c{chunk_idx}",
+                    file_name=file_name,
+                    page_number=page_num,
+                    chunk_index=chunk_idx,
+                    chunk_text=text.strip(),
+                    word_count=len(text.split()),
+                    content_type="body",
+                    section_hierarchy=current_hierarchy.copy(),
+                    section_number=current_section_num,
+                    parent_section=get_parent_section(current_section_num),
+                    source_folder=source_folder
+                ))
+                chunk_idx += 1
+                current_text = []
     
-    # ===== STEP 5: Combine all chunks =====
-    # Order: tables first (often referenced), then text, then figures
-    all_chunks = table_chunks + text_chunks + figure_chunks
-    
-    # Re-index all chunks sequentially
-    for i, chunk in enumerate(all_chunks):
-        chunk['chunk_index'] = i
-    
-    return all_chunks
+    return chunks
 
 
-# =========================================================
-# MAIN FUNCTION
-# =========================================================
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Enhanced OCR with Structure Detection")
-    
-    parser.add_argument("folder_path", help="Path to PDF folder")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Output JSON file (default: <folder>_enhanced_output.json)")
-    parser.add_argument("--first-page-only", action="store_true",
-                        help="Process only first page of each PDF")
-    parser.add_argument("--no-resize", action="store_true",
-                        help="Disable image resizing")
-    parser.add_argument("--no-tables", action="store_true",
-                        help="Disable table extraction with pdfplumber")
-    parser.add_argument("--tiles", type=int, choices=[1, 2, 4], default=1,
-                        help="Number of tiles for OCR (default: 2)")
-    parser.add_argument("--dpi", type=int, default=200, help="DPI for PDF rendering")
-    parser.add_argument("--det-limit", type=int, default=1920, help="OCR detection limit")
-    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, 
-                        help="Chunk size in characters")
-    parser.add_argument("--overlap", type=int, default=CHUNK_OVERLAP, 
-                        help="Chunk overlap in characters")
-    parser.add_argument("--cpu", action="store_true", help="Use CPU instead of GPU")
-    
-    return parser.parse_args()
-    
-    return parser.parse_args()
-
-
-def main():
-    args = parse_arguments()
-    folder = args.folder_path
-    
-    if not os.path.isdir(folder):
-        logger.error(f"Invalid folder path: {folder}")
-        sys.exit(1)
-    
-    # Output filename
-    if args.output:
-        output_file = args.output
-    else:
-        folder_name = os.path.basename(os.path.normpath(folder))
-        output_file = f"{folder_name}_enhanced_output.json"
+def process_folder(
+    folder_path: str,
+    output_file: str,
+    dpi: int = DPI,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP
+) -> Dict:
+    """Process all PDFs in a folder."""
     
     # Find PDFs
     pdf_files = []
-    for root, dirs, files in os.walk(folder):
-        source = os.path.basename(root) if root != folder else os.path.basename(folder)
-        for f in files:
-            if f.lower().endswith(".pdf") and not f.endswith('.Zone.Identifier'):
-                pdf_files.append((os.path.join(root, f), source))
+    if os.path.isfile(folder_path) and folder_path.lower().endswith('.pdf'):
+        pdf_files = [folder_path]
+        folder_path = os.path.dirname(folder_path) or '.'
+    else:
+        for root, _, files in os.walk(folder_path):
+            for f in files:
+                if f.lower().endswith('.pdf'):
+                    pdf_files.append(os.path.join(root, f))
     
     if not pdf_files:
-        logger.error("No PDFs found.")
-        sys.exit(1)
+        logger.error("No PDF files found")
+        return {}
     
-    pdf_files.sort()
-    logger.info(f"Found {len(pdf_files)} PDF files")
-    logger.info(f"✨ Enhanced mode: Structure detection + smart chunking ENABLED")
+    logger.info(f"Found {len(pdf_files)} PDF(s)")
     
-    # Check table extraction availability
-    extract_tables = not args.no_tables and PDFPLUMBER_AVAILABLE
-    if extract_tables:
-        logger.info(f"✓ Table extraction ENABLED (pdfplumber)")
-    else:
-        if args.no_tables:
-            logger.info(f"⚠️ Table extraction DISABLED (--no-tables flag)")
-        else:
-            logger.info(f"⚠️ Table extraction DISABLED (pdfplumber not installed)")
+    # Initialize extractor
+    extractor = DocumentExtractor(dpi=dpi)
+    extractor.init_ocr()
     
-    # Initialize enhanced OCR engine
-    logger.info("Initializing Enhanced PaddleOCR...")
-    ocr_engine = EnhancedTextDetection()
-    ocr_engine.initPaddle(det_limit=args.det_limit, use_gpu=not args.cpu)
-    
-    # Process PDFs
     all_chunks = []
+    failed_pdfs = []
     start_time = datetime.now()
     
-    for idx, (pdf_path, source) in enumerate(tqdm(pdf_files, desc="Processing PDFs"), 1):
-        chunks = build_enhanced_chunks(
-            pdf_path, source, ocr_engine,
-            args.chunk_size, args.overlap, args.tiles, args.dpi,
-            first_page_only=args.first_page_only,
-            resize_large=not args.no_resize,
-            extract_tables=extract_tables
-        )
-        if chunks:
+    source_folder = os.path.basename(folder_path)
+    
+    for pdf_path in tqdm(pdf_files, desc="Processing PDFs"):
+        try:
+            pages_data, meta = extractor.process_pdf(pdf_path)
+            
+            if 'error' in meta:
+                failed_pdfs.append({'file': pdf_path, 'error': meta['error']})
+                continue
+            
+            # Create chunks
+            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+            safe_name = re.sub(r'[^\w\-]', '_', base_name.lower())
+            
+            chunks = create_chunks(
+                pages_data,
+                safe_name,
+                source_folder,
+                chunk_size,
+                overlap
+            )
             all_chunks.extend(chunks)
+            
+        except Exception as e:
+            logger.error(f"Failed to process {pdf_path}: {e}")
+            failed_pdfs.append({'file': pdf_path, 'error': str(e)})
         
-        if idx % 10 == 0:
-            gc.collect()
+        gc.collect()
     
-    elapsed = (datetime.now() - start_time).total_seconds()
+    # Cleanup
+    extractor.cleanup()
     
-    # Calculate OCR quality stats
-    avg_conf = sum(ocr_engine.stats['avg_confidence']) / len(ocr_engine.stats['avg_confidence']) \
-               if ocr_engine.stats['avg_confidence'] else 0.0
-    
-    # Calculate content type stats
-    table_chunks = sum(1 for c in all_chunks if c.get('content_type') == 'table')
-    figure_chunks = sum(1 for c in all_chunks if c.get('content_type') == 'figure')
-    text_chunks = sum(1 for c in all_chunks if c.get('content_type') in ['text', 'text_with_table_ref', 'text_with_figure_ref'])
+    processing_time = (datetime.now() - start_time).total_seconds()
     
     # Build output
-    output_data = {
-        "folder_path": os.path.abspath(folder),
-        "extraction_date": datetime.now().isoformat(),
-        "processing_time_seconds": elapsed,
-        "total_chunks": len(all_chunks),
-        "total_pdfs": len(pdf_files),
-        "content_types": {
-            "text_chunks": text_chunks,
-            "table_chunks": table_chunks,
-            "figure_chunks": figure_chunks
+    output = {
+        'folder_path': os.path.abspath(folder_path),
+        'extraction_date': datetime.now().isoformat(),
+        'processing_time_seconds': processing_time,
+        'total_chunks': len(all_chunks),
+        'stats': extractor.stats,
+        'failed_pdfs': failed_pdfs,
+        'config': {
+            'dpi': dpi,
+            'chunk_size': chunk_size,
+            'overlap': overlap,
+            'ocr_version': 'PP-OCRv5'
         },
-        "ocr_quality": {
-            "average_confidence": round(avg_conf, 3),
-            "low_confidence_pages": ocr_engine.stats['low_confidence_pages'],
-            "total_pages": ocr_engine.stats['pages']
-        },
-        "config": {
-            "enhanced_mode": True,
-            "structure_detection": True,
-            "smart_chunking": True,
-            "table_extraction": extract_tables,
-            "figure_linking": True,
-            "reading_order_correction": True,
-            "first_page_only": args.first_page_only,
-            "tiles": args.tiles,
-            "dpi": args.dpi,
-            "chunk_size": args.chunk_size,
-            "overlap": args.overlap,
-            "use_gpu": not args.cpu
-        },
-        "chunks": all_chunks
+        'chunks': [c.to_dict() for c in all_chunks]
     }
     
-    # Save
+    # Write output
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(output_data, f, ensure_ascii=False, indent=2)
+        json.dump(output, f, ensure_ascii=False, indent=2)
     
-    # Stats
-    sections_with_metadata = sum(1 for c in all_chunks if c.get('section_number'))
-    docs_with_codes = sum(1 for c in all_chunks if c.get('document_code'))
+    logger.info(f"✓ Saved {len(all_chunks)} chunks to {output_file}")
+    logger.info(f"  Processing time: {processing_time:.1f}s")
+    logger.info(f"  Stats: {extractor.stats}")
     
-    logger.info(f"\n{'='*70}")
-    logger.info(f"✓ Enhanced OCR extraction complete!")
-    logger.info(f"✓ Processed {len(pdf_files)} PDFs in {elapsed:.1f}s")
-    logger.info(f"✓ Extracted {len(all_chunks)} total chunks:")
-    logger.info(f"    - Text chunks: {text_chunks}")
-    logger.info(f"    - Table chunks: {table_chunks}")
-    logger.info(f"    - Figure chunks: {figure_chunks}")
-    logger.info(f"✓ OCR quality: {avg_conf:.1%} average confidence")
-    logger.info(f"✓ Low confidence pages: {ocr_engine.stats['low_confidence_pages']}/{ocr_engine.stats['pages']}")
-    logger.info(f"✓ Chunks with section metadata: {sections_with_metadata}/{len(all_chunks)}")
-    logger.info(f"✓ Documents with codes detected: {docs_with_codes}")
-    logger.info(f"✓ Output: {output_file}")
-    logger.info(f"\nNext: python rag-indexer-ppocrv5-embed-separated.py {output_file}")
-    logger.info(f"{'='*70}\n")
+    return output
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract structured text from PDFs using PPOCRv5'
+    )
+    parser.add_argument('input', help='PDF file or folder path')
+    parser.add_argument('-o', '--output', default='ocr_output.json',
+                        help='Output JSON file')
+    parser.add_argument('--dpi', type=int, default=DPI,
+                        help=f'DPI for PDF rendering (default: {DPI})')
+    parser.add_argument('--chunk-size', type=int, default=CHUNK_SIZE,
+                        help=f'Chunk size in characters (default: {CHUNK_SIZE})')
+    parser.add_argument('--overlap', type=int, default=CHUNK_OVERLAP,
+                        help=f'Chunk overlap in characters (default: {CHUNK_OVERLAP})')
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.input):
+        logger.error(f"Input path not found: {args.input}")
+        sys.exit(1)
+    
+    process_folder(
+        args.input,
+        args.output,
+        dpi=args.dpi,
+        chunk_size=args.chunk_size,
+        overlap=args.overlap
+    )
+
+
+if __name__ == '__main__':
     main()

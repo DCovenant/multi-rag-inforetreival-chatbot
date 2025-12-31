@@ -1,0 +1,49 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - path.repo=/usr/share/elasticsearch/backups
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - indices.memory.index_buffer_size=20%
+      - indices.fielddata.cache.size=20%
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      - ./backups:/usr/share/elasticsearch/backups
+    mem_limit: 4g
+    mem_reservation: 2g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  paddleocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.paddleocr
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./:/workspace
+      - /mnt/i:/mnt/i:ro
+    working_dir: /workspace
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: tail -f /dev/null
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  esdata:

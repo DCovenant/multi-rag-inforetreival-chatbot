@@ -119,7 +119,7 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         return ""
 
 
-def generate_queries_for_chunk(chunk_text: str, doc_title: str, 
+def generate_queries_for_chunk(chunk_text: str, file_name: str, 
                                n_queries: int = 3, model: str = OLLAMA_MODEL) -> List[str]:
     """
     Generate realistic user queries that this chunk would answer.
@@ -140,7 +140,7 @@ IMPORTANT RULES:
 4. Be specific - avoid vague questions like "tell me about..."
 5. Questions should be 10-30 words long
 
-Document: {doc_title}
+Document: {file_name}
 
 Text excerpt:
 \"\"\"
@@ -307,12 +307,12 @@ def generate_query_pairs(chunks: List[Dict], n_pairs: int,
                   f"generated {len(pairs)} pairs (validated: {stats['queries_validated']}, "
                   f"rejected: {stats['queries_rejected']})...")
         
-        doc_title = chunk.get('doc_title', chunk.get('file_name', 'Unknown'))
+        file_name = chunk.get('file_name', chunk.get('file_name', 'Unknown'))
         chunk_text = chunk['chunk_text']
         chunk_id = chunk.get('chunk_id', str(random.randint(0, 1000000)))
         
         # Generate queries for this chunk
-        queries = generate_queries_for_chunk(chunk_text, doc_title, queries_per_chunk, model)
+        queries = generate_queries_for_chunk(chunk_text, file_name, queries_per_chunk, model)
         stats['queries_generated'] += len(queries)
         
         if not queries:

@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # Config
-INDEX_NAME = "sse_specs"  # Adjust to your index
+INDEX_NAME = "___"  # Adjust to your index
 
 # Initialize once
 es = Elasticsearch(ES_URL, request_timeout=60)

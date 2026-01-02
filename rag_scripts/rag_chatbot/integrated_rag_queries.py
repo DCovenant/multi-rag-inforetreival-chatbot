@@ -15,12 +15,11 @@ import time
 from typing import List, Dict, Optional
 from elasticsearch import Elasticsearch
 
-from utils.optimized_retrieval import search_documents
-from utils.table_context import build_context
-
 DEBUG = False
 
 try:
+    from utils.optimized_retrieval import search_documents
+    from utils.table_context import build_context
     from utils.conversation_history import ConversationHistory
     from utils.model_loading import get_model
     from utils.centralized_prompts import ANSWER_GENERATION_DIRECT, build_table_instruction
@@ -33,13 +32,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- CONFIG ---
-ES_URL = "http://localhost:9200"
-OLLAMA_URL = "http://localhost:11434/api/generate"
-#OLLAMA_MODEL = "llama3.1:8b"
-OLLAMA_MODEL = "qwen2.5:14b"
+ES_URL = os.getenv("ES_URL", "http://localhost:9200")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = "llama3.1:8b"
+#OLLAMA_MODEL = "qwen2.5:14b"
 
 # Models - MUST match index embedding dimensions (384)
-EMBED_MODEL = "all-MiniLM-L6-v2"  # 384 dims - matches your index
+EMBED_MODEL = "all-mpnet-base-v2"  # 384 dims - matches your index
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 FINAL_TOP_K = 10

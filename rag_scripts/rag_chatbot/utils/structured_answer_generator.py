@@ -38,6 +38,7 @@ try:
         REQUIREMENT_SCHEMA,
         build_table_instruction
     )
+    from utils.table_context import build_context
 except ImportError:
     logger.error("Failed to import prompts. Ensure centralized_prompts.py is in utils/")
     raise
@@ -211,7 +212,6 @@ def extract_structured_facts(
 def _build_context(chunks: List[Dict]) -> str:
     """Build context string from chunks with metadata."""
     # Import here to avoid circular imports
-    from utils.table_context import build_context
     return build_context(chunks)
 
 

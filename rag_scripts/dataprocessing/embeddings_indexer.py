@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class EmbeddingGenerator:
     """Generates embeddings using sentence-transformers."""
     
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "all-mpnet-base-v2"):
         from sentence_transformers import SentenceTransformer
         logger.info(f"Loading embedding model: {model_name}")
         self.model = SentenceTransformer(model_name)
@@ -162,7 +162,7 @@ def process_and_index(
     es_url: str = "http://localhost:9200",
     index_name: str = "documents",
     output_file: Optional[str] = None,
-    model_name: str = "all-MiniLM-L6-v2",
+    model_name: str = "all-mpnet-base-v2",
     batch_size: int = 32,
     reset_index: bool = False
 ):
@@ -241,7 +241,7 @@ def main():
         es_url="http://localhost:9200",
         index_name=index_name,
         output_file=args.output,
-        model_name="all-MiniLM-L6-v2",
+        model_name="all-mpnet-base-v2",
         batch_size=32,
         reset_index=args.reset
     )

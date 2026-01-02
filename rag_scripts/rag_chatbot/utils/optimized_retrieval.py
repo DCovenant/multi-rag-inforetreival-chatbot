@@ -101,7 +101,6 @@ def _hybrid_search(
         # Execute both searches
         bm25_resp = es.search(index=index_name, query=bm25_query, size=BM25_K, _source=SOURCE_FIELDS)
         vector_resp = es.search(index=index_name, knn=knn_query, size=VECTOR_K, _source=SOURCE_FIELDS)
-        
         bm25_hits = _parse_hits(bm25_resp, "bm25")
         vector_hits = _parse_hits(vector_resp, "vector")
         

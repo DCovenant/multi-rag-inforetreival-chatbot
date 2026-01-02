@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Models and checkpoints
+checkpoints/
+*.pth
+*.bin
+*.onnx
+*.h5
+*.pb
+
+# Data
+dataset/
+*.csv
+*.parquet
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+
+# Node
+node_modules/
+dist/
+build/
+
+# Elasticsearch
+rag_scripts/backups/
+rag_scripts/i/
+
+# Test files
+test_pdfs/
+*.pdf
+
+*.json
